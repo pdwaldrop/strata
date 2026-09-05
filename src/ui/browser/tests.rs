@@ -2,6 +2,7 @@
 
 mod focus;
 mod sidebar;
+mod spinner;
 
 use super::*;
 

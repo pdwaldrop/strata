@@ -4768,11 +4768,18 @@ impl ViewState {
                 .collect::<Vec<_>>();
             set_column_selections(column, &positions);
             if snapshot.loading {
+                // A load already in flight before the mode switch: show immediately
+                // rather than leaving `append_column`'s delayed arm to do it later.
+                cancel_column_spinner(column);
+                column.spinner.set_visible(true);
                 column.spinner.start();
                 column.presentation.show_loading();
             } else {
-                column.spinner.stop();
-                column.spinner.set_visible(false);
+                // `append_column` above always arms a delayed spinner; a location
+                // whose data is already loaded gets no further load event to stop
+                // it, so it must be cancelled here or it fires ~120ms from now and
+                // spins forever with nothing left to turn it off.
+                stop_column_spinner(column);
                 if let Some(message) = snapshot.error.as_deref() {
                     column
                         .presentation
