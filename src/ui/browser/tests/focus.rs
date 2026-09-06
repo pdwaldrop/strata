@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::*;
+use crate::{app::BrowserEvent, ui::browser::columns::is_column_background};
 use std::time::{Duration, Instant};
 
 #[track_caller]
@@ -31,6 +32,7 @@ fn press_column_background(view: &BrowserView, depth: usize) {
 }
 
 #[test]
+#[ignore = "requires a mapped GTK window; run this test alone"]
 fn horizontal_scrollbar_stays_below_destination_hints() {
     const CHILD: &str = "STRATA_DESTINATION_SCROLLBAR_GTK_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -40,6 +42,7 @@ fn horizontal_scrollbar_stays_below_destination_hints() {
                 "--exact",
                 "ui::browser::tests::focus::horizontal_scrollbar_stays_below_destination_hints",
                 "--nocapture",
+                "--ignored",
             ])
             .env(CHILD, "1")
             .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
@@ -128,6 +131,7 @@ fn horizontal_scrollbar_stays_below_destination_hints() {
 }
 
 #[test]
+#[ignore = "requires a mapped GTK window; run this test alone"]
 fn pane_ownership_routes_commands_and_preserves_selection() {
     const CHILD: &str = "STRATA_FOCUS_GTK_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -137,6 +141,7 @@ fn pane_ownership_routes_commands_and_preserves_selection() {
                 "--exact",
                 "ui::browser::tests::focus::pane_ownership_routes_commands_and_preserves_selection",
                 "--nocapture",
+                "--ignored",
             ])
             .env(CHILD, "1")
             .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
@@ -303,7 +308,7 @@ fn pane_ownership_routes_commands_and_preserves_selection() {
         assert!(!is_column_background(surface.upcast_ref(), &control));
     }
 
-    for mode in [BrowserMode::Grid, BrowserMode::Explorer] {
+    for mode in [BrowserMode::Icons, BrowserMode::List] {
         view.set_view_mode(mode);
         assert_eq!(view.state.destination_depth(), browser.active_depth());
     }

@@ -22,10 +22,13 @@ use crate::{
 
 use super::{
     blur::BlurBin,
-    browser::{BrowserView, PeekBehavior, PinStatus, show_error_dialog},
+    browser::{
+        BrowserView, PeekBehavior, PinStatus, file_drop_action, locations_from_file_list_value,
+        show_error_dialog,
+    },
     browser_modes::{BrowserDensity, BrowserMode},
     motion::{animations_enabled, emphasized_deceleration},
-    preview::PreviewDrawer,
+    preview::{PreviewDrawer, preview_target},
     search::SearchDialog,
     theme::ThemeManager,
 };
@@ -48,9 +51,21 @@ struct TypeToSearch {
     preferences: Rc<ThemeManager>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TypeToSearchQuery {
+    Empty,
+    Character(char),
+}
+
 impl TypeToSearch {
-    fn show(&self, query: char) -> bool {
-        self.preferences.type_to_search() && self.view.show_filter_with_query(&query.to_string())
+    fn show(&self, query: TypeToSearchQuery) -> bool {
+        self.preferences.type_to_search()
+            && match query {
+                TypeToSearchQuery::Empty => self.view.show_filter(),
+                TypeToSearchQuery::Character(character) => {
+                    self.view.show_filter_with_query(&character.to_string())
+                }
+            }
     }
 }
 
@@ -123,30 +138,7 @@ fn present_target(
         }))),
         true,
     );
-    let preview_for_selection = preview.clone();
-    let weak_controller = Rc::downgrade(&controller);
-    controller.observe(move |event| match event {
-        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry.clone()),
-        BrowserEvent::FocusChanged {
-            depth,
-            position: Some(position),
-        } if preview_for_selection.is_open() => {
-            if let Some(entry) = weak_controller
-                .upgrade()
-                .and_then(|browser| browser.entry_at(*depth, *position))
-            {
-                if entry.is_directory() {
-                    preview_for_selection.close();
-                } else {
-                    preview_for_selection.show(entry);
-                }
-            }
-        }
-        BrowserEvent::FocusChanged { position: None, .. } if preview_for_selection.is_open() => {
-            preview_for_selection.close();
-        }
-        _ => {}
-    });
+    preview.observe_browser(&controller);
 
     let header = gtk::HeaderBar::new();
     header.set_show_title_buttons(false);
@@ -314,6 +306,7 @@ fn present_target(
             search_preview.show(FileEntry {
                 location,
                 native_name: item.path.file_name().unwrap_or_default().to_os_string(),
+                thumbnail_path: None,
                 display_name: item.name,
                 kind: EntryKind::File,
                 size: MetadataValue::Unknown,
@@ -333,6 +326,7 @@ fn present_target(
     window_overlay.add_overlay(&search_dialog.widget());
     let shown_search = search_dialog.clone();
     let search_blurred_root = blurred_root.clone();
+    let search_preferences = theme_manager.clone();
     search_button.connect_clicked(move |button| {
         if shown_search.is_visible() {
             shown_search.hide();
@@ -341,12 +335,13 @@ fn present_target(
         let root = home_directory();
         button.add_css_class("active");
         search_blurred_root.set_blurred(true);
-        shown_search.show(root);
+        shown_search.show(root, search_preferences.sort_preferences().show_hidden);
     });
     let search_action = gio::SimpleAction::new("search", None);
     let shortcut_search = search_dialog.clone();
     let shortcut_search_button = search_button.clone();
     let shortcut_search_root = blurred_root.clone();
+    let shortcut_search_preferences = theme_manager.clone();
     search_action.connect_activate(move |_, _| {
         if shortcut_search.is_visible() {
             shortcut_search.hide();
@@ -354,7 +349,10 @@ fn present_target(
             let root = home_directory();
             shortcut_search_button.add_css_class("active");
             shortcut_search_root.set_blurred(true);
-            shortcut_search.show(root);
+            shortcut_search.show(
+                root,
+                shortcut_search_preferences.sort_preferences().show_hidden,
+            );
         }
     });
     window.add_action(&search_action);
@@ -980,6 +978,11 @@ fn install_keyboard_navigation(
         if !control && !alt && !view.item_view_has_focus() && !header_left_boundary {
             return glib::Propagation::Proceed;
         }
+        if let Some(direction) = jump_direction(key, modifiers)
+            && view.jump_selection(direction)
+        {
+            return glib::Propagation::Stop;
+        }
         if view.item_view_has_focus()
             && let Some(action) = single_pane_arrow_action(
                 view.view_mode(),
@@ -1001,7 +1004,7 @@ fn install_keyboard_navigation(
                     if !control
                         && !shift
                         && let Some(direction) = sidebar_focus_direction(key)
-                        && view.move_grid_group(direction)
+                        && view.move_icons_group(direction)
                     {
                         glib::Propagation::Stop
                     } else {
@@ -1032,7 +1035,7 @@ fn install_keyboard_navigation(
             return glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::space && !alt && !control {
-            preview.toggle(browser.focused_entry());
+            preview.toggle(preview_target(browser.focused_entry()));
             return glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Escape && preview.is_open() {
@@ -1114,7 +1117,7 @@ fn single_pane_arrow_action(
     let plain = !modifiers.intersects(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK);
     match key {
         Key::Left if plain && at_left_edge && sidebar_visible => Some(SinglePaneArrow::Sidebar),
-        Key::Left | Key::Right if mode == BrowserMode::Explorer => Some(SinglePaneArrow::Stay),
+        Key::Left | Key::Right if mode == BrowserMode::List => Some(SinglePaneArrow::Stay),
         Key::Left | Key::Right | Key::Up | Key::Down => Some(SinglePaneArrow::Native),
         _ => None,
     }
@@ -1161,6 +1164,22 @@ fn page_direction(key: gtk::gdk::Key) -> Option<i32> {
     }
 }
 
+fn jump_direction(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> Option<i32> {
+    use gtk::gdk::{Key, ModifierType};
+    if !modifiers.contains(ModifierType::CONTROL_MASK)
+        || modifiers.intersects(
+            ModifierType::SHIFT_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
+        )
+    {
+        return None;
+    }
+    match key {
+        Key::Up => Some(-1),
+        Key::Down => Some(1),
+        _ => None,
+    }
+}
+
 fn is_undo_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
     modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
         && !modifiers
@@ -1168,15 +1187,26 @@ fn is_undo_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bo
         && matches!(key, gtk::gdk::Key::z | gtk::gdk::Key::Z)
 }
 
-fn type_to_search_query(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> Option<char> {
-    if modifiers.intersects(
-        gtk::gdk::ModifierType::CONTROL_MASK
-            | gtk::gdk::ModifierType::ALT_MASK
-            | gtk::gdk::ModifierType::SUPER_MASK,
-    ) {
+fn type_to_search_query(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+) -> Option<TypeToSearchQuery> {
+    // Space belongs to quick preview; focused text fields handle their own spaces.
+    if key == gtk::gdk::Key::space
+        || modifiers.intersects(
+            gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK,
+        )
+    {
         return None;
     }
-    key.to_unicode().filter(|character| !character.is_control())
+    if key == gtk::gdk::Key::slash {
+        return Some(TypeToSearchQuery::Empty);
+    }
+    key.to_unicode()
+        .filter(|character| !character.is_control())
+        .map(TypeToSearchQuery::Character)
 }
 
 fn is_open_terminal_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
@@ -1278,22 +1308,22 @@ pub(super) fn build_appearance_menu(
     let popover_weak = popover.downgrade();
     append_menu_heading(&content, "VIEW");
     let current_mode = view.view_mode();
-    let (list, list_check, _) = appearance_option(
-        crate::assets::icons::LIST,
-        "List",
+    let (columns, columns_check, _) = appearance_option(
+        crate::assets::icons::COLUMNS,
+        "Columns",
         current_mode == BrowserMode::Columns,
         true,
     );
-    let (grid, grid_check, _) = appearance_option(
-        crate::assets::icons::GRID,
-        "Grid",
-        current_mode == BrowserMode::Grid,
+    let (icons, icons_check, _) = appearance_option(
+        crate::assets::icons::ICONS,
+        "Icons",
+        current_mode == BrowserMode::Icons,
         true,
     );
-    let (explorer, explorer_check, _) = appearance_option(
-        crate::assets::icons::ROWS,
-        "Explorer",
-        current_mode == BrowserMode::Explorer,
+    let (list, list_check, _) = appearance_option(
+        crate::assets::icons::LIST,
+        "List",
+        current_mode == BrowserMode::List,
         true,
     );
     let grouped = preferences.group_by_type();
@@ -1304,7 +1334,7 @@ pub(super) fn build_appearance_menu(
         current_mode != BrowserMode::Columns,
     );
     group_by_type.set_tooltip_text(Some(
-        "Group Explorer and Grid entries under file-type headings",
+        "Group List and Icons entries under file-type headings",
     ));
     {
         let view = view.clone();
@@ -1323,32 +1353,32 @@ pub(super) fn build_appearance_menu(
         });
     }
     for (button, mode) in [
-        (&list, BrowserMode::Columns),
-        (&grid, BrowserMode::Grid),
-        (&explorer, BrowserMode::Explorer),
+        (&columns, BrowserMode::Columns),
+        (&icons, BrowserMode::Icons),
+        (&list, BrowserMode::List),
     ] {
         let view = view.clone();
+        let columns_check = columns_check.clone();
+        let icons_check = icons_check.clone();
         let list_check = list_check.clone();
-        let grid_check = grid_check.clone();
-        let explorer_check = explorer_check.clone();
         let group_by_type = group_by_type.clone();
         let preferences = preferences.clone();
         let popover_weak = popover_weak.clone();
         button.connect_clicked(move |_| {
             view.set_view_mode(mode);
             preferences.set_browser_mode(mode);
-            list_check.set_visible(mode == BrowserMode::Columns);
-            grid_check.set_visible(mode == BrowserMode::Grid);
-            explorer_check.set_visible(mode == BrowserMode::Explorer);
+            columns_check.set_visible(mode == BrowserMode::Columns);
+            icons_check.set_visible(mode == BrowserMode::Icons);
+            list_check.set_visible(mode == BrowserMode::List);
             group_by_type.set_sensitive(mode != BrowserMode::Columns);
             if let Some(popover) = popover_weak.upgrade() {
                 popover.popdown();
             }
         });
     }
+    content.append(&columns);
+    content.append(&icons);
     content.append(&list);
-    content.append(&grid);
-    content.append(&explorer);
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     append_menu_heading(&content, "DENSITY");
@@ -1804,6 +1834,14 @@ impl SidebarState {
         row.add_controller(drag);
 
         let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        drop.connect_accept(|_, offered| {
+            accepts_sidebar_reorder_payload(
+                offered.formats().contains_type(String::static_type()),
+                offered
+                    .formats()
+                    .contains_type(gtk::gdk::FileList::static_type()),
+            )
+        });
         let weak_state = Rc::downgrade(self);
         let target_row = row.clone();
         drop.connect_drop(move |_, value, _, y| {
@@ -1831,6 +1869,7 @@ impl SidebarState {
         self.place_rows
             .borrow_mut()
             .push((location.clone(), row.clone()));
+        install_sidebar_file_drop(&self.view, &row, location.clone());
         let weak_browser = Rc::downgrade(&self.browser);
         let sidebar = self.widget.clone();
         let selected_row = row.clone();
@@ -1900,7 +1939,10 @@ impl SidebarState {
         if let Some(mount) = volume.get_mount()
             && let Some(location) = location_for_file(&mount.root())
         {
-            self.place_rows.borrow_mut().push((location, row.clone()));
+            self.place_rows
+                .borrow_mut()
+                .push((location.clone(), row.clone()));
+            install_sidebar_file_drop(&self.view, &row, location);
         }
         let weak_browser = Rc::downgrade(&self.browser);
         let sidebar = self.widget.clone();
@@ -2126,6 +2168,7 @@ impl SidebarState {
         self.place_rows
             .borrow_mut()
             .push((location.clone(), row.clone()));
+        install_sidebar_file_drop(&self.view, &row, location.clone());
         let weak_browser = Rc::downgrade(&self.browser);
         let sidebar = self.widget.clone();
         let selected_row = row.clone();
@@ -2150,6 +2193,45 @@ impl SidebarState {
         }
         row
     }
+}
+
+fn accepts_sidebar_reorder_payload(has_string: bool, has_file_list: bool) -> bool {
+    has_string && !has_file_list
+}
+
+fn sidebar_accepts_file_drop(location: &Location) -> bool {
+    location.native_path().is_some()
+}
+
+fn install_sidebar_file_drop(
+    view: &BrowserView,
+    row: &impl IsA<gtk::Widget>,
+    destination: Location,
+) {
+    if !sidebar_accepts_file_drop(&destination) {
+        return;
+    }
+    row.add_css_class("file-drop-zone");
+    let drop = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
+    );
+    drop.set_propagation_phase(gtk::PropagationPhase::Capture);
+    drop.connect_enter(|target, _, _| file_drop_action(target));
+    drop.connect_motion(|target, _, _| file_drop_action(target));
+    let view = view.clone();
+    drop.connect_drop(move |target, value, _, _| {
+        let Some(sources) = locations_from_file_list_value(value) else {
+            return false;
+        };
+        if sources.is_empty() {
+            return false;
+        }
+        let move_sources = file_drop_action(target) == gtk::gdk::DragAction::MOVE;
+        view.start_transfer(destination.clone(), sources, move_sources);
+        true
+    });
+    row.add_controller(drop);
 }
 
 fn select_sidebar_row(sidebar: &gtk::Box, selected: &gtk::Button) {

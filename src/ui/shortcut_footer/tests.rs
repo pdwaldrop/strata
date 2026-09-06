@@ -4,13 +4,10 @@ use super::*;
 
 #[test]
 fn navigation_reference_matches_each_mode() {
-    for mode in [
-        BrowserMode::Columns,
-        BrowserMode::Grid,
-        BrowserMode::Explorer,
-    ] {
+    for mode in [BrowserMode::Columns, BrowserMode::Icons, BrowserMode::List] {
         let navigation = navigation_shortcuts(mode);
         assert!(navigation.contains(&("Alt+↑", "Go to the parent folder")));
+        assert!(navigation.contains(&("Ctrl+↑ / Ctrl+↓", "First / last item")));
         assert!(navigation.contains(&("↑ at top", "Focus the navigation header")));
         assert!(navigation.contains(&("↓ in header", "Return to the files")));
         assert!(navigation.contains(&("↑ at sidebar top", "Focus the top navigation bar")));
@@ -18,19 +15,17 @@ fn navigation_reference_matches_each_mode() {
         assert!(summary_shortcuts(mode).contains(&("Enter", "Open")));
     }
     assert!(
-        navigation_shortcuts(BrowserMode::Grid)
+        navigation_shortcuts(BrowserMode::Icons)
             .contains(&("← at left edge", "Focus the visible sidebar"))
     );
-    assert!(
-        navigation_shortcuts(BrowserMode::Explorer).contains(&("←", "Focus the visible sidebar"))
-    );
+    assert!(navigation_shortcuts(BrowserMode::List).contains(&("←", "Focus the visible sidebar")));
     assert_ne!(
         summary_shortcuts(BrowserMode::Columns),
-        summary_shortcuts(BrowserMode::Grid)
+        summary_shortcuts(BrowserMode::Icons)
     );
     assert_ne!(
-        summary_shortcuts(BrowserMode::Grid),
-        summary_shortcuts(BrowserMode::Explorer)
+        summary_shortcuts(BrowserMode::Icons),
+        summary_shortcuts(BrowserMode::List)
     );
     assert!(
         navigation_shortcuts(BrowserMode::Columns)
@@ -40,6 +35,7 @@ fn navigation_reference_matches_each_mode() {
 }
 
 #[test]
+#[ignore = "requires a mapped GTK window; run this test alone"]
 fn footer_tracks_modes_and_shields_files_while_open() {
     const CHILD: &str = "STRATA_SHORTCUT_FOOTER_GTK_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -49,6 +45,7 @@ fn footer_tracks_modes_and_shields_files_while_open() {
                 "--exact",
                 "ui::shortcut_footer::tests::footer_tracks_modes_and_shields_files_while_open",
                 "--nocapture",
+                "--ignored",
             ])
             .env(CHILD, "1")
             .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
@@ -84,11 +81,7 @@ fn footer_tracks_modes_and_shields_files_while_open() {
     window.present();
     entry.grab_focus();
     settle();
-    for mode in [
-        BrowserMode::Grid,
-        BrowserMode::Explorer,
-        BrowserMode::Columns,
-    ] {
+    for mode in [BrowserMode::Icons, BrowserMode::List, BrowserMode::Columns] {
         view.set_view_mode(mode);
         assert!(
             footer
@@ -139,7 +132,7 @@ fn footer_tracks_modes_and_shields_files_while_open() {
     assert_eq!(footer.handle_key(gdk::Key::Delete, none), None);
     let manager = super::super::theme::ThemeManager::shared();
     footer.bind_preferences(&manager);
-    let other = ShortcutFooter::new(BrowserMode::Grid);
+    let other = ShortcutFooter::new(BrowserMode::Icons);
     other.bind_preferences(&manager);
     for enabled in [false, true, false] {
         manager.set_show_keybinding_hints(enabled);

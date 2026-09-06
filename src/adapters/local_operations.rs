@@ -28,7 +28,7 @@ use std::{
 use gtk::{gio, glib, prelude::*};
 
 use crate::{
-    adapters::location_for_file,
+    adapters::{gio_file_for_location, location_for_file},
     model::Location,
     services::{
         ArchiveFormat, CancelledOperation, CompressRequest, CreateDirectoryRequest,
@@ -53,13 +53,6 @@ where
         start(object, &cancellable, result);
     })
     .await
-}
-
-fn gio_file(location: &Location) -> gio::File {
-    location
-        .native_path()
-        .map(gio::File::for_path)
-        .unwrap_or_else(|| gio::File::for_uri(location.uri_value().unwrap_or_default()))
 }
 
 struct TransferProgressTracker {
@@ -577,9 +570,7 @@ fn copy_recursively_local(
                     .path()
                     .ok_or_else(|| io_error("Copy destination must be a local path"))?;
                 run_local_fs_step(move || {
-                    rustix::fs::symlink(&link_target, &target_path).map_err(|error| {
-                        format!("Could not recreate {}: {error}", target_path.display())
-                    })
+                    copy_local_symlink(&link_target, &target_path, overwrite_existing)
                 })
                 .await
             }
@@ -676,18 +667,7 @@ fn copy_recursively_local_path(
         let Some(name) = source_path.file_name().map(OsStr::to_os_string) else {
             return Err(io_error("Invalid copy source"));
         };
-        let parent = run_local_fs_step(move || {
-            rustix::fs::open(
-                &parent_path,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(|error| format!("Could not open {}: {error}", parent_path.display()))
-        })
-        .await?;
+        let parent = run_local_fs_step(move || open_local_parent_directory(&parent_path)).await?;
         copy_recursively_local(
             parent,
             name,
@@ -1043,6 +1023,56 @@ async fn move_local_with(
     move_local_with_progress(source, target, cancellable, None, attempt_move).await
 }
 
+/// Opens both parents without following symlinks, then atomically renames
+/// without replacing a destination created by a concurrent process.
+fn move_local_path(
+    source_path: PathBuf,
+    target_path: PathBuf,
+    cancellable: gio::Cancellable,
+) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>>>> {
+    Box::pin(async move {
+        if cancellable.is_cancelled() {
+            return Err(cancelled_local_operation());
+        }
+        let Some(source_parent_path) = source_path.parent().map(Path::to_path_buf) else {
+            return Err(io_error("Cannot move the filesystem root"));
+        };
+        let Some(source_name) = source_path.file_name().map(OsStr::to_os_string) else {
+            return Err(io_error("Invalid move source"));
+        };
+        let Some(target_parent_path) = target_path.parent().map(Path::to_path_buf) else {
+            return Err(io_error("The move destination has no parent directory"));
+        };
+        let Some(target_name) = target_path.file_name().map(OsStr::to_os_string) else {
+            return Err(io_error("Invalid move destination"));
+        };
+
+        let source_parent =
+            run_local_fs_step(move || open_local_parent_directory(&source_parent_path)).await?;
+        let target_parent =
+            run_local_fs_step(move || open_local_parent_directory(&target_parent_path)).await?;
+
+        let display_name = source_name.to_string_lossy().into_owned();
+        gio::spawn_blocking(move || {
+            rustix::fs::renameat_with(
+                &source_parent,
+                &source_name,
+                &target_parent,
+                &target_name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+        })
+        .await
+        .map_err(|_| io_error("Move task panicked"))?
+        .map_err(|error| match error {
+            rustix::io::Errno::XDEV | rustix::io::Errno::INVAL => {
+                glib::Error::new(gio::IOErrorEnum::WouldRecurse, "Cannot move directly")
+            }
+            error => io_error(format!("Could not move {display_name}: {error}")),
+        })
+    })
+}
+
 async fn move_local(
     source: gio::File,
     target: gio::File,
@@ -1056,6 +1086,15 @@ async fn move_local(
         cancellable,
         fallback_progress,
         Rc::new(move |source, target, cancellable| {
+            if source.is_native()
+                && target.is_native()
+                && let (Some(source_path), Some(target_path)) = (source.path(), target.path())
+            {
+                return move_local_path(source_path, target_path, cancellable);
+            }
+            // Remote (GVfs) locations have no local descriptor to walk against, so
+            // anything not fully local keeps the GIO path-based move below rather
+            // than claiming an equivalent guarantee.
             let move_progress = progress.as_ref().map(TransferProgressTracker::begin_file);
             let progress_callback = move_progress.as_ref().map(FileTransferProgress::callback);
             Box::pin(async move {
@@ -1275,49 +1314,15 @@ async fn replace_local_with_progress(
         move_source,
         cancellable,
         affected_locations,
-        Rc::new(move |source, staged, directory, cancellable| {
-            let progress = progress.clone();
-            Box::pin(async move {
-                if directory {
-                    copy_recursively_with_progress(
-                        source,
-                        staged,
-                        true,
-                        cancellable,
-                        None,
-                        progress,
-                    )
-                    .await
-                } else {
-                    let flags = gio::FileCopyFlags::ALL_METADATA
-                        | gio::FileCopyFlags::NOFOLLOW_SYMLINKS
-                        | gio::FileCopyFlags::OVERWRITE;
-                    let file_progress = progress.as_ref().map(TransferProgressTracker::begin_file);
-                    let progress_callback =
-                        file_progress.as_ref().map(FileTransferProgress::callback);
-                    let result = await_cancellable(
-                        &source,
-                        &cancellable,
-                        move |source, cancellable, result| {
-                            source.copy_async(
-                                &staged,
-                                flags,
-                                glib::Priority::DEFAULT,
-                                Some(cancellable),
-                                progress_callback,
-                                move |output| result.resolve(output),
-                            );
-                        },
-                    )
-                    .await;
-                    if result.is_ok()
-                        && let Some(file_progress) = file_progress
-                    {
-                        file_progress.finish();
-                    }
-                    result
-                }
-            })
+        Rc::new(move |source, staged, _directory, cancellable| {
+            copy_recursively_with_progress(
+                source,
+                staged,
+                true,
+                cancellable,
+                None,
+                progress.clone(),
+            )
         }),
     )
     .await
@@ -1579,9 +1584,45 @@ fn permanently_delete_local(
     })
 }
 
-fn open_local_delete_parent(parent_path: &Path) -> Result<OwnedFd, String> {
+/// Uses a staged link so overwriting remains atomic without following the target.
+fn copy_local_symlink(
+    link_target: &OsStr,
+    target_path: &Path,
+    overwrite_existing: bool,
+) -> Result<(), String> {
+    let parent_path = target_path
+        .parent()
+        .ok_or_else(|| "The symlink destination has no parent directory".to_owned())?;
+    let target_name = target_path
+        .file_name()
+        .ok_or_else(|| "Invalid symlink destination".to_owned())?;
+    let parent = open_local_parent_directory(parent_path)?;
+
+    if !overwrite_existing {
+        return rustix::fs::symlinkat(link_target, &parent, target_name)
+            .map_err(|error| format!("Could not recreate {}: {error}", target_path.display()));
+    }
+
+    let staged_name = format!(".strata-symlink-{}", glib::uuid_string_random());
+    rustix::fs::symlinkat(link_target, &parent, &staged_name)
+        .map_err(|error| format!("Could not stage {}: {error}", target_path.display()))?;
+    let result = rustix::fs::renameat_with(
+        &parent,
+        &staged_name,
+        &parent,
+        target_name,
+        rustix::fs::RenameFlags::empty(),
+    );
+    if result.is_err() {
+        let _ = rustix::fs::unlinkat(&parent, &staged_name, rustix::fs::AtFlags::empty());
+    }
+    result.map_err(|error| format!("Could not recreate {}: {error}", target_path.display()))
+}
+
+/// Resolves every component from the filesystem root without following symlinks.
+fn open_local_parent_directory(parent_path: &Path) -> Result<OwnedFd, String> {
     if !parent_path.is_absolute() {
-        return Err("A local delete target must use an absolute path".to_owned());
+        return Err("A local operation target must use an absolute path".to_owned());
     }
     let root = rustix::fs::open(
         c"/",
@@ -1591,7 +1632,7 @@ fn open_local_delete_parent(parent_path: &Path) -> Result<OwnedFd, String> {
     .map_err(|error| format!("Could not open the filesystem root: {error}"))?;
     let relative = parent_path
         .strip_prefix(Path::new("/"))
-        .map_err(|_| "A local delete target must use an absolute path".to_owned())?;
+        .map_err(|_| "A local operation target must use an absolute path".to_owned())?;
     if relative.as_os_str().is_empty() {
         return Ok(root);
     }
@@ -1622,7 +1663,8 @@ fn permanently_delete_local_path_if_unchanged(
         let Some(name) = path.file_name().map(OsStr::to_os_string) else {
             return Err(io_error("Invalid delete target"));
         };
-        let parent = run_local_delete_step(move || open_local_delete_parent(&parent_path)).await?;
+        let parent =
+            run_local_delete_step(move || open_local_parent_directory(&parent_path)).await?;
         permanently_delete_local(parent, name, expected, cancellable).await
     })
 }
@@ -1641,7 +1683,7 @@ async fn local_file_identity(file: &gio::File) -> Result<Option<LocalFileIdentit
         let name = path
             .file_name()
             .ok_or_else(|| "Invalid local filesystem target".to_owned())?;
-        let parent = open_local_delete_parent(parent_path)?;
+        let parent = open_local_parent_directory(parent_path)?;
         let stat = rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
         Ok(LocalFileIdentity::from_stat(&stat))
@@ -2033,7 +2075,7 @@ impl OperationProvider for LocalOperationProvider {
         let cancellable = gio::Cancellable::new();
         let operation_cancellable = cancellable.clone();
         let _task = glib::MainContext::default().spawn_local(async move {
-            let parent = gio_file(&request.parent);
+            let parent = gio_file_for_location(&request.parent);
             let folder = match validated_child(&parent, &request.name) {
                 Ok(folder) => folder,
                 Err(message) => {
@@ -2104,7 +2146,7 @@ impl OperationProvider for LocalOperationProvider {
         let cancellable = gio::Cancellable::new();
         let operation_cancellable = cancellable.clone();
         let _task = glib::MainContext::default().spawn_local(async move {
-            let parent = gio_file(&request.parent);
+            let parent = gio_file_for_location(&request.parent);
             let file = match validated_child(&parent, &request.name) {
                 Ok(file) => file,
                 Err(message) => {
@@ -2172,7 +2214,7 @@ impl OperationProvider for LocalOperationProvider {
         let cancellable = gio::Cancellable::new();
         let operation_cancellable = cancellable.clone();
         let _task = glib::MainContext::default().spawn_local(async move {
-            let destination = gio_file(&request.destination);
+            let destination = gio_file_for_location(&request.destination);
             let mut affected_locations = HashSet::from([request.destination.clone()]);
             for parent in request.items.iter().filter_map(|item| item.source.parent()) {
                 affected_locations.insert(parent);
@@ -2180,7 +2222,7 @@ impl OperationProvider for LocalOperationProvider {
             let sources = request
                 .items
                 .iter()
-                .map(|item| gio_file(&item.source))
+                .map(|item| gio_file_for_location(&item.source))
                 .collect::<Vec<_>>();
             let (item_sizes, total_bytes) =
                 match transfer_sizes(&sources, &operation_cancellable).await {
@@ -2399,7 +2441,7 @@ impl OperationProvider for LocalOperationProvider {
             let sources = request
                 .items
                 .iter()
-                .map(|item| gio_file(&item.record.current))
+                .map(|item| gio_file_for_location(&item.record.current))
                 .collect::<Vec<_>>();
             let (item_sizes, total_bytes) =
                 match transfer_sizes(&sources, &operation_cancellable).await {
@@ -2449,7 +2491,7 @@ impl OperationProvider for LocalOperationProvider {
                 }
                 let source = sources[index].clone();
                 let item_started_at = progress.transferred_bytes.get();
-                let target = gio_file(&item.record.original);
+                let target = gio_file_for_location(&item.record.original);
                 let result = if item.conflict == TransferConflict::ReplaceExisting {
                     replace_local_with_progress(
                         source,
@@ -2536,7 +2578,7 @@ impl OperationProvider for LocalOperationProvider {
                     ));
                     return;
                 }
-                let file = gio_file(&entry.location);
+                let file = gio_file_for_location(&entry.location);
                 let result = if request.permanent {
                     if entry
                         .location
@@ -2678,9 +2720,9 @@ impl OperationProvider for LocalOperationProvider {
                     ));
                     return;
                 }
-                let source = gio_file(&entry.source);
+                let source = gio_file_for_location(&entry.source);
                 let result = if let Some(original_target) = entry.original_target.clone() {
-                    let target = gio_file(&original_target);
+                    let target = gio_file_for_location(&original_target);
                     if let Some(parent) = original_target.parent() {
                         affected_locations.insert(parent);
                     }

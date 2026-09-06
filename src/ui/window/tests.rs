@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod type_to_search;
+
 use std::{cell::Cell, path::Path};
 
-use crate::services::{BuildKind, ReleaseMetadata};
+use crate::{
+    model::Location,
+    services::{BuildKind, ReleaseMetadata},
+};
 
 use super::{
-    MediaRelease, MouseHistoryAction, PinStatus, STANDARD_PLACE_IDS, begin_media_release,
-    is_open_terminal_shortcut, is_sidebar_focus_shortcut, is_smb_location,
-    is_standard_place_location, is_toggle_hidden_shortcut, is_undo_shortcut, media_release_label,
+    MediaRelease, MouseHistoryAction, PinStatus, STANDARD_PLACE_IDS, TypeToSearchQuery,
+    accepts_sidebar_reorder_payload, begin_media_release, is_open_terminal_shortcut,
+    is_sidebar_focus_shortcut, is_smb_location, is_standard_place_location,
+    is_toggle_hidden_shortcut, is_undo_shortcut, jump_direction, media_release_label,
     mount_release_action, mouse_history_action, page_direction, parse_pinned_drag_source,
     parse_pinned_places, pin_status, remove_pinned_place, reorder_pinned_places, reorder_places,
-    resolve_place_order, serialize_pinned_places, should_show_standard_place, sidebar_update_label,
-    standard_place, type_to_search_query, vim_focus_direction, volume_release_action,
+    resolve_place_order, serialize_pinned_places, should_show_standard_place,
+    sidebar_accepts_file_drop, sidebar_update_label, standard_place, type_to_search_query,
+    vim_focus_direction, volume_release_action,
 };
 
 fn release(version: &str, kind: BuildKind) -> ReleaseMetadata {
@@ -33,10 +40,10 @@ fn plain_single_pane_arrows_move_focus_not_directories() {
     use gtk::gdk::{Key, ModifierType};
     let plain = ModifierType::empty();
     assert_eq!(
-        single_pane_arrow_action(BrowserMode::Grid, Key::Left, plain, false, true),
+        single_pane_arrow_action(BrowserMode::Icons, Key::Left, plain, false, true),
         Some(SinglePaneArrow::Native)
     );
-    for mode in [BrowserMode::Grid, BrowserMode::Explorer] {
+    for mode in [BrowserMode::Icons, BrowserMode::List] {
         assert_eq!(
             single_pane_arrow_action(mode, Key::Left, plain, true, true),
             Some(SinglePaneArrow::Sidebar)
@@ -59,15 +66,15 @@ fn plain_single_pane_arrows_move_focus_not_directories() {
         );
     }
     assert_eq!(
-        single_pane_arrow_action(BrowserMode::Explorer, Key::Right, plain, true, true),
+        single_pane_arrow_action(BrowserMode::List, Key::Right, plain, true, true),
         Some(SinglePaneArrow::Stay)
     );
     assert_eq!(
-        single_pane_arrow_action(BrowserMode::Explorer, Key::Left, plain, true, false),
+        single_pane_arrow_action(BrowserMode::List, Key::Left, plain, true, false),
         Some(SinglePaneArrow::Stay)
     );
     assert_eq!(
-        single_pane_arrow_action(BrowserMode::Grid, Key::Left, plain, true, false),
+        single_pane_arrow_action(BrowserMode::Icons, Key::Left, plain, true, false),
         Some(SinglePaneArrow::Native)
     );
     assert_eq!(
@@ -76,7 +83,7 @@ fn plain_single_pane_arrows_move_focus_not_directories() {
     );
     for modifier in [ModifierType::SHIFT_MASK, ModifierType::CONTROL_MASK] {
         assert_eq!(
-            single_pane_arrow_action(BrowserMode::Grid, Key::Left, modifier, true, true),
+            single_pane_arrow_action(BrowserMode::Icons, Key::Left, modifier, true, true),
             Some(SinglePaneArrow::Native)
         );
     }
@@ -207,6 +214,24 @@ fn page_keys_map_to_a_scroll_direction() {
 }
 
 #[test]
+fn jump_shortcut_requires_control_without_other_command_modifiers() {
+    use gtk::gdk::{Key, ModifierType};
+    let control = ModifierType::CONTROL_MASK;
+
+    assert_eq!(jump_direction(Key::Up, control), Some(-1));
+    assert_eq!(jump_direction(Key::Down, control), Some(1));
+    assert_eq!(jump_direction(Key::Left, control), None);
+    assert_eq!(jump_direction(Key::Up, ModifierType::empty()), None);
+    for modifier in [
+        ModifierType::SHIFT_MASK,
+        ModifierType::ALT_MASK,
+        ModifierType::SUPER_MASK,
+    ] {
+        assert_eq!(jump_direction(Key::Up, control | modifier), None);
+    }
+}
+
+#[test]
 fn toggle_hidden_shortcut_accepts_h_or_period_with_only_control() {
     let control = gtk::gdk::ModifierType::CONTROL_MASK;
     let shift = gtk::gdk::ModifierType::SHIFT_MASK;
@@ -244,16 +269,34 @@ fn sidebar_focus_shortcut_requires_control_and_shift() {
 fn type_to_search_accepts_printable_keys_without_command_modifiers() {
     assert_eq!(
         type_to_search_query(gtk::gdk::Key::a, gtk::gdk::ModifierType::empty()),
-        Some('a')
+        Some(TypeToSearchQuery::Character('a'))
     );
     assert_eq!(
         type_to_search_query(gtk::gdk::Key::A, gtk::gdk::ModifierType::SHIFT_MASK),
-        Some('A')
+        Some(TypeToSearchQuery::Character('A'))
     );
     assert_eq!(
-        type_to_search_query(gtk::gdk::Key::space, gtk::gdk::ModifierType::empty()),
-        Some(' ')
+        type_to_search_query(gtk::gdk::Key::period, gtk::gdk::ModifierType::empty()),
+        Some(TypeToSearchQuery::Character('.'))
     );
+}
+
+#[test]
+fn type_to_search_uses_slash_to_open_an_empty_filter() {
+    assert_eq!(
+        type_to_search_query(gtk::gdk::Key::slash, gtk::gdk::ModifierType::empty()),
+        Some(TypeToSearchQuery::Empty)
+    );
+}
+
+#[test]
+fn type_to_search_leaves_space_for_quick_preview() {
+    for modifiers in [
+        gtk::gdk::ModifierType::empty(),
+        gtk::gdk::ModifierType::SHIFT_MASK,
+    ] {
+        assert_eq!(type_to_search_query(gtk::gdk::Key::space, modifiers), None);
+    }
 }
 
 #[test]
@@ -697,4 +740,26 @@ fn media_release_guard_rejects_repeated_actions_until_completion() {
 
     in_flight.set(false);
     assert!(begin_media_release(&in_flight));
+}
+
+#[test]
+fn file_payloads_are_not_claimed_as_sidebar_reorders() {
+    assert!(accepts_sidebar_reorder_payload(true, false));
+    assert!(!accepts_sidebar_reorder_payload(true, true));
+    assert!(!accepts_sidebar_reorder_payload(false, true));
+}
+
+#[test]
+fn sidebar_file_drops_accept_local_places_but_not_virtual_locations() {
+    assert!(sidebar_accepts_file_drop(&Location::local(
+        "/run/media/user/stick"
+    )));
+    assert!(sidebar_accepts_file_drop(&Location::local(
+        "/home/user/Documents"
+    )));
+    assert!(!sidebar_accepts_file_drop(&Location::uri("trash:///")));
+    assert!(!sidebar_accepts_file_drop(&Location::uri("network:///")));
+    assert!(!sidebar_accepts_file_drop(&Location::uri(
+        "smb://host.example/share"
+    )));
 }

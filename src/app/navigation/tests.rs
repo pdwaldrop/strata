@@ -18,6 +18,7 @@ fn entry(path: &str) -> FileEntry {
 
 fn named_entry(path: &str, name: &str) -> FileEntry {
     FileEntry {
+        thumbnail_path: None,
         location: location(path),
         native_name: OsString::from(name),
         display_name: name.into(),
@@ -500,6 +501,7 @@ fn parent_removes_the_deepest_committed_column() {
 
 fn hidden_entry(path: &str, name: &str) -> FileEntry {
     FileEntry {
+        thumbnail_path: None,
         location: location(path),
         native_name: OsString::from(name),
         display_name: name.into(),
@@ -625,6 +627,25 @@ fn paging_skips_hidden_entries_when_hidden_files_are_not_shown() {
     assert!(state.select(0, 0));
     assert_eq!(state.page_selection(1, 1), Some((0, 2)));
     assert_eq!(state.page_selection(-1, 1), Some((0, 0)));
+}
+
+#[test]
+fn paging_by_usize_max_jumps_to_the_first_or_last_visible_entry() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            hidden_entry("/home/alpha", "alpha"),
+            named_entry("/home/bravo", "bravo"),
+            named_entry("/home/charlie", "charlie"),
+            hidden_entry("/home/delta", "delta"),
+        ],
+    );
+
+    assert!(state.select(0, 2));
+    assert_eq!(state.page_selection(1, usize::MAX), Some((0, 2)));
+    assert_eq!(state.page_selection(-1, usize::MAX), Some((0, 1)));
 }
 
 #[test]
@@ -830,6 +851,7 @@ fn file_entry(path: &str, name: &str) -> FileEntry {
     FileEntry {
         location: location(path),
         native_name: OsString::from(name),
+        thumbnail_path: None,
         display_name: name.into(),
         kind: EntryKind::File,
         size: MetadataValue::Unknown,
